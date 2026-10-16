@@ -30,6 +30,40 @@ func emissionChunks(events ...string) []*schemas.BifrostStreamChunk {
 
 const emissionCompleted = `{"type":"response.completed","response":{"id":"resp-test","usage":{"input_tokens":3,"output_tokens":2}}}`
 
+// The actual served tier can differ from the request. Never infer it from cfg.
+func TestEmissionPreservesReportedServiceTier(t *testing.T) {
+	for _, tier := range []string{"priority", "default", ""} {
+		t.Run(tier, func(t *testing.T) {
+			terminal := map[string]any{"id": "resp-tier", "status": "completed"}
+			if tier != "" {
+				terminal["service_tier"] = tier
+			}
+			events := []string{`{"type":"response.output_text.delta","delta":"OK"}`, canonicalJSON(map[string]any{"type": "response.completed", "response": terminal})}
+			check := func(response *schemas.BifrostChatResponse) {
+				t.Helper()
+				if tier == "" {
+					if response.ServiceTier != nil {
+						t.Fatal("invented a service tier absent from upstream")
+					}
+				} else if response.ServiceTier == nil || string(*response.ServiceTier) != tier {
+					t.Fatalf("reported tier %q lost: %v", tier, response.ServiceTier)
+				}
+				raw := response.ExtraFields.RawResponse.(map[string]any)
+				if tier != "" && raw["service_tier"] != tier {
+					t.Fatalf("wire tier lost: %v", raw["service_tier"])
+				}
+			}
+			response, failure := aggregateChat(emissionResponse(events...), "model", 123)
+			if failure != nil {
+				t.Fatal(failure)
+			}
+			check(response)
+			chunks := emissionChunks(events...)
+			check(chunks[len(chunks)-1].BifrostChatResponse)
+		})
+	}
+}
+
 func TestEmissionReasoningThinkTagsAndSingleFinish(t *testing.T) {
 	old := cfg.ReasoningCompat
 	cfg.ReasoningCompat = "think-tags"

@@ -39,37 +39,35 @@ func buildPayloadFromChat(req *schemas.BifrostChatRequest, clientSessionID strin
 		}
 	}
 
-	var tools []map[string]any
+	var baseTools []map[string]any
 	parallel := false
 	toolChoice := any("auto")
 	if req.Params != nil {
-		tools = toolsToResponses(req.Params.Tools)
+		baseTools = toolsToResponses(req.Params.Tools)
 		if req.Params.ParallelToolCalls != nil {
 			parallel = *req.Params.ParallelToolCalls
 		}
 		toolChoice = toolChoiceValue(req.Params.ToolChoice)
 	}
-	tools, toolChoice = applyWebSearchDefault(tools, toolChoice)
-	if req.Params != nil {
-		extra := chatExtraParams(req)
-		validTools := []map[string]any{}
-		if specified, ok := extra["responses_tools"].([]any); ok && len(specified) > 0 {
-			for _, item := range specified {
-				if tool, ok := item.(map[string]any); ok {
-					if kind, ok := tool["type"].(string); ok && kind != "" {
-						validTools = append(validTools, tool)
-					}
+	tools, toolChoice := applyWebSearchDefault(baseTools, toolChoice)
+	extra := chatExtraParams(req)
+	validTools := []map[string]any{}
+	if specified, ok := extra["responses_tools"].([]any); ok && len(specified) > 0 {
+		for _, item := range specified {
+			if tool, ok := item.(map[string]any); ok {
+				if kind, ok := tool["type"].(string); ok && kind != "" {
+					validTools = append(validTools, tool)
 				}
 			}
 		}
-		if len(validTools) > 0 {
-			tools = append(toolsToResponses(req.Params.Tools), validTools...)
-		}
-		if choice, ok := extra["responses_tool_choice"].(string); ok && (choice == "auto" || choice == "none") {
-			toolChoice = choice
-			if choice == "none" && len(validTools) == 0 {
-				tools = toolsToResponses(req.Params.Tools)
-			}
+	}
+	if len(validTools) > 0 {
+		tools = append(baseTools, validTools...)
+	}
+	if choice, ok := extra["responses_tool_choice"].(string); ok && (choice == "auto" || choice == "none") {
+		toolChoice = choice
+		if choice == "none" && len(validTools) == 0 {
+			tools = baseTools
 		}
 	}
 
@@ -89,20 +87,16 @@ func buildPayloadFromChat(req *schemas.BifrostChatRequest, clientSessionID strin
 	}
 	reasoning := buildReasoningParam(cfg.ReasoningEffort, cfg.ReasoningSummary, overrides, allowedEffortsForModel(model))
 
-	var requestFastMode any
+	// Raw extensions also apply when the SDK request has no typed params.
+	requestFastMode := extra["fast_mode"]
 	var requestServiceTier any
 	if req.Params != nil {
-		if extra := chatExtraParams(req); extra != nil {
-			if v, ok := extra["fast_mode"]; ok {
-				requestFastMode = v
-			}
-		}
 		if req.Params.ServiceTier != nil {
 			requestServiceTier = string(*req.Params.ServiceTier)
 		}
-		if requestServiceTier == nil {
-			requestServiceTier = chatExtraParams(req)["service_tier"]
-		}
+	}
+	if requestServiceTier == nil {
+		requestServiceTier = extra["service_tier"]
 	}
 	tier := resolveServiceTier(model, requestFastMode, requestServiceTier)
 
@@ -137,7 +131,11 @@ func buildPayloadFromResponses(req *schemas.BifrostResponsesRequest, clientSessi
 	// (temperature, top_p, text, truncation, metadata, tool_choice, tools,
 	// parallel_tool_calls, previous_response_id, user, ...) survive.
 	payload = map[string]any{}
-	_ = json.Unmarshal(req.RawRequestBody, &payload)
+	hasWireRequest := json.Unmarshal(req.RawRequestBody, &payload) == nil && payload != nil
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	callerTools, _ := payload["tools"].([]any)
 	delete(payload, "provider")
 	if req.Params != nil {
 		if b, err := json.Marshal(req.Params); err == nil {
@@ -203,12 +201,21 @@ func buildPayloadFromResponses(req *schemas.BifrostResponsesRequest, clientSessi
 		}
 	}
 
-	// Web-search default when the caller sent no tools.
+	// Bifrost can inject MCP functions after HTTP parsing. Those are not the
+	// caller's tool selection and must not disable the configured search default.
+	// SDK requests without an HTTP body use their typed tool selection instead.
 	tools, _ := payload["tools"].([]any)
-	if len(tools) == 0 && cfg.EnableWebSearch {
+	if cfg.EnableWebSearch && (len(tools) == 0 || (hasWireRequest && len(callerTools) == 0)) {
 		choice, _ := payload["tool_choice"].(string)
-		if choice != "none" {
-			payload["tools"] = []any{map[string]any{"type": "web_search"}}
+		if !strings.EqualFold(strings.TrimSpace(choice), "none") {
+			hasSearch := false
+			for _, value := range tools {
+				tool, _ := value.(map[string]any)
+				hasSearch = hasSearch || tool["type"] == "web_search" || tool["type"] == "web_search_preview"
+			}
+			if !hasSearch {
+				payload["tools"] = append(tools, map[string]any{"type": "web_search"})
+			}
 		}
 	}
 	if _, ok := payload["tool_choice"]; !ok {
@@ -313,9 +320,6 @@ func chatExtraParams(req *schemas.BifrostChatRequest) map[string]any {
 
 // validateChatOptions runs before credentials or any upstream request.
 func validateChatOptions(req *schemas.BifrostChatRequest) *schemas.BifrostError {
-	if req.Params == nil {
-		return nil
-	}
 	extra := chatExtraParams(req)
 	if tools := asAnySlice(extra["responses_tools"]); len(tools) > 0 {
 		for _, raw := range tools {
@@ -333,7 +337,7 @@ func validateChatOptions(req *schemas.BifrostChatRequest) *schemas.BifrostError 
 		}
 	}
 	var serviceTier any
-	if req.Params.ServiceTier != nil {
+	if req.Params != nil && req.Params.ServiceTier != nil {
 		serviceTier = string(*req.Params.ServiceTier)
 	}
 	if serviceTier == nil {

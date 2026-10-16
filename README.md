@@ -162,6 +162,10 @@ Options belong in the plugin's `config` object. See [config.example.json](config
 
 Matching `CHATGPT_LOCAL_*` environment variables are supported. Request-level reasoning settings, ChatMock's `fast_mode`, `responses_tools`, and `responses_tool_choice` extensions, and session/cache affinity are preserved.
 
+Fast mode requests `service_tier: "priority"` for supported models. Chat Completions and Responses preserve the tier reported by upstream; requesting priority does not guarantee it was served. Set `fast_mode: false` on an individual request to opt out of the server default.
+
+Native Responses preserves completed `web_search_call` items and citation annotations. When the caller omits tools, the default web search remains available alongside MCP tools injected by Bifrost. A `function_call` is a client tool request, not evidence that web search ran. To disable the default search tool for a request, use `tool_choice: "none"` (or ChatMock's `responses_tool_choice: "none"` on Chat Completions).
+
 ## Development
 
 ```sh

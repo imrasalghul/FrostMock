@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/maximhq/bifrost/core/schemas"
 )
 
 type fakeRoundTripper func(*http.Request) (*http.Response, error)
@@ -102,5 +104,88 @@ func TestUpstreamMissingAccountRejectedBeforeNetwork(t *testing.T) {
 	}
 	if err == nil || calls != 0 {
 		t.Fatalf("missing account contacted network: err=%v calls=%d", err, calls)
+	}
+}
+
+// Exercise request defaults and the final HTTP boundary together. A native
+// search result must remain a completed server tool, not a client function call.
+func TestNativeResponsesSearchAndTierThroughHooks(t *testing.T) {
+	upstreamAuth(t, "account")
+	oldConfig, oldTransport := *cfg, http.DefaultTransport
+	cfg.FastMode, cfg.EnableWebSearch = true, true
+	t.Cleanup(func() { *cfg, http.DefaultTransport = oldConfig, oldTransport })
+	installCatalogFixture(t, `{"models":[{"slug":"gpt-6.1-sol","visibility":"list","service_tiers":["priority"]}]}`)
+	for _, servedTier := range []string{"priority", "default"} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(servedTier+"/"+canonicalJSON(streaming), func(t *testing.T) {
+				completed := map[string]any{
+					"id": "resp-search", "object": "response", "model": "gpt-6.1-sol", "status": "completed", "service_tier": servedTier,
+					"output": []any{
+						map[string]any{"type": "web_search_call", "id": "ws-1", "status": "completed", "action": map[string]any{"type": "search", "query": "Go release", "sources": []any{map[string]any{"type": "url", "url": "https://go.dev/dl/"}}}},
+						map[string]any{"type": "message", "id": "msg-1", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "Go release — official source.", "annotations": []any{map[string]any{"type": "url_citation", "url": "https://go.dev/dl/", "title": "Downloads", "start_index": 0, "end_index": 10}}}}},
+					},
+				}
+				event := map[string]any{"type": "response.completed", "response": completed}
+				http.DefaultTransport = fakeRoundTripper(func(r *http.Request) (*http.Response, error) {
+					var payload map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Fatal(err)
+					}
+					if payload["service_tier"] != "priority" || canonicalJSON(payload["tools"]) != `[{"type":"web_search"}]` {
+						t.Fatalf("server defaults lost: tier=%v tools=%v", payload["service_tier"], payload["tools"])
+					}
+					return fakeHTTP(200, "data: "+canonicalJSON(event)+"\n\n"), nil
+				})
+				ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+				defer ctx.Cancel()
+				httpReq := &schemas.HTTPRequest{Method: "POST", Path: "/v1/responses", Body: []byte(`{"model":"chatgpt/gpt-6.1-sol","input":"Use web search."}`)}
+				if _, err := HTTPTransportPreHook(ctx, httpReq); err != nil {
+					t.Fatal(err)
+				}
+				kind := schemas.ResponsesRequest
+				if streaming {
+					kind = schemas.ResponsesStreamRequest
+				}
+				req := &schemas.BifrostRequest{RequestType: kind, ResponsesRequest: &schemas.BifrostResponsesRequest{Provider: ProviderName, Model: "gpt-6.1-sol", Params: &schemas.ResponsesParameters{}}}
+				_, short, err := PreLLMHook(ctx, req)
+				if err != nil || short == nil || short.Error != nil {
+					t.Fatalf("request failed: %v %+v", err, short)
+				}
+				if streaming {
+					count := 0
+					for chunk := range short.Stream {
+						count++
+						if chunk.BifrostResponsesStreamResponse == nil {
+							t.Fatalf("unexpected chunk: %+v", chunk)
+						}
+						// Core fills routing metadata and can strip raw logging fields.
+						chunk.BifrostResponsesStreamResponse.ExtraFields.Provider = ProviderName
+						chunk.BifrostResponsesStreamResponse.ExtraFields.RawResponse = nil
+						out, err := HTTPTransportStreamChunkHook(ctx, httpReq, chunk)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if canonicalJSON(out.BifrostResponsesStreamResponse.ExtraFields.RawResponse) != canonicalJSON(event) {
+							t.Fatal("search output, citations or served tier changed")
+						}
+					}
+					if count != 1 {
+						t.Fatalf("terminal events=%d", count)
+					}
+				} else {
+					body, err := json.Marshal(short.Response.ResponsesResponse)
+					if err != nil {
+						t.Fatal(err)
+					}
+					response := &schemas.HTTPResponse{StatusCode: 200, Body: body}
+					if err := HTTPTransportPostHook(ctx, httpReq, response); err != nil {
+						t.Fatal(err)
+					}
+					if canonicalJSON(json.RawMessage(response.Body)) != canonicalJSON(completed) {
+						t.Fatalf("native wire response changed: %s", response.Body)
+					}
+				}
+			})
+		}
 	}
 }

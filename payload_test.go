@@ -183,6 +183,115 @@ func TestPayloadIgnoresMalformedResponseToolEntries(t *testing.T) {
 	}
 }
 
+func TestPayloadChatRawFastModeWithoutTypedParams(t *testing.T) {
+	old := cfg.FastMode
+	cfg.FastMode = true
+	t.Cleanup(func() { cfg.FastMode = old })
+	req := &schemas.BifrostChatRequest{Model: "gpt-5.4", RawRequestBody: []byte(`{"fast_mode":false}`)}
+	got, _ := buildPayloadFromChat(req, "session")
+	if _, exists := got["service_tier"]; exists {
+		t.Fatalf("explicit opt-out was ignored: %v", got["service_tier"])
+	}
+	req.Model = "gpt-5.3-codex"
+	req.RawRequestBody = []byte(`{"fast_mode":true}`)
+	if validateChatOptions(req) == nil {
+		t.Fatal("unsupported explicit priority must fail even without typed params")
+	}
+}
+
+func TestPayloadChatRawSearchOptOutWithoutTypedParams(t *testing.T) {
+	old := cfg.EnableWebSearch
+	cfg.EnableWebSearch = true
+	t.Cleanup(func() { cfg.EnableWebSearch = old })
+	req := &schemas.BifrostChatRequest{Model: "gpt-5.4", RawRequestBody: []byte(`{"responses_tool_choice":"none"}`)}
+	got, _ := buildPayloadFromChat(req, "session")
+	if got["tool_choice"] != "none" || len(asAnySlice(got["tools"])) != 0 {
+		t.Fatalf("explicit search opt-out was ignored: choice=%v tools=%v", got["tool_choice"], got["tools"])
+	}
+}
+
+func TestPayloadNativeSearchDefaultsAndPriorityOverrides(t *testing.T) {
+	old := *cfg
+	cfg.FastMode, cfg.EnableWebSearch = true, true
+	t.Cleanup(func() { *cfg = old })
+	installCatalogFixture(t, `{"models":[{"slug":"gpt-6.1-sol","visibility":"list","service_tiers":["priority"]}]}`)
+	for _, tc := range []struct {
+		name, options, tier string
+		search              bool
+	}{
+		{"server defaults", ``, "priority", true},
+		{"disable fast", `,"fast_mode":false`, "", true},
+		{"explicit default", `,"service_tier":"default"`, "default", true},
+		{"fast wins", `,"fast_mode":true,"service_tier":"default"`, "priority", true},
+		{"disable search", `,"tool_choice":"none"`, "priority", false},
+		{"explicit function", `,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]`, "priority", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"chatgpt/gpt-6.1-sol","input":"hello"` + tc.options + `}`)
+			var params schemas.ResponsesParameters
+			if err := json.Unmarshal(body, &params); err != nil {
+				t.Fatal(err)
+			}
+			req := &schemas.BifrostResponsesRequest{Model: "gpt-6.1-sol", Params: &params, RawRequestBody: body}
+			if failure := validateResponsesOptions(req); failure != nil {
+				t.Fatal(failure)
+			}
+			got, _ := buildPayloadFromResponses(req, "session")
+			tier, _ := got["service_tier"].(string)
+			if tier != tc.tier {
+				t.Fatalf("tier=%q want %q", tier, tc.tier)
+			}
+			if _, exists := got["fast_mode"]; exists {
+				t.Fatal("local option leaked upstream")
+			}
+			search := false
+			for _, item := range asAnySlice(got["tools"]) {
+				if item.(map[string]any)["type"] == "web_search" {
+					search = true
+				}
+			}
+			if search != tc.search {
+				t.Fatalf("search=%v want %v; tools=%v", search, tc.search, got["tools"])
+			}
+		})
+	}
+}
+
+func TestPayloadNativeInjectedToolsDoNotSuppressDefaultSearch(t *testing.T) {
+	old := cfg.EnableWebSearch
+	cfg.EnableWebSearch = true
+	t.Cleanup(func() { cfg.EnableWebSearch = old })
+	for _, tc := range []struct {
+		name, raw string
+		search    bool
+	}{
+		{"omitted tools", `{"input":"Search the web."}`, true},
+		{"empty tools", `{"input":"Search the web.","tools":[]}`, true},
+		{"caller opted out", `{"input":"Search the web.","tool_choice":"none"}`, false},
+		{"caller supplied tools", `{"input":"Search the web.","tools":[{"type":"function","name":"lookup"}]}`, false},
+		{"SDK supplied tools", ``, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Bifrost's MCP integration injects a function after HTTP parsing.
+			var params schemas.ResponsesParameters
+			if err := json.Unmarshal([]byte(`{"tools":[{"type":"function","name":"listToolFiles","parameters":{"type":"object"}}]}`), &params); err != nil {
+				t.Fatal(err)
+			}
+			req := &schemas.BifrostResponsesRequest{Model: "gpt-5.4", Params: &params, RawRequestBody: []byte(tc.raw)}
+			got, _ := buildPayloadFromResponses(req, "session")
+			search, injected := false, false
+			for _, item := range asAnySlice(got["tools"]) {
+				tool := item.(map[string]any)
+				search = search || tool["type"] == "web_search"
+				injected = injected || tool["name"] == "listToolFiles"
+			}
+			if search != tc.search || !injected {
+				t.Fatalf("search=%v want %v; injected=%v; tools=%v", search, tc.search, injected, got["tools"])
+			}
+		})
+	}
+}
+
 // Used by offline transport tests without any real credentials or backend.
 func testCodexStream(events ...string) *codexResponse {
 	var b strings.Builder

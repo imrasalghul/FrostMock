@@ -20,6 +20,7 @@ type chatAccumulator struct {
 	webSearch                                                   map[string]map[string]any
 	sawFunction                                                 bool
 	usage                                                       *schemas.BifrostLLMUsage
+	serviceTier                                                 *schemas.BifrostServiceTier
 	thinkOpen, thinkClosed, sawSummary, pendingSummaryParagraph bool
 }
 
@@ -29,6 +30,9 @@ func (acc *chatAccumulator) observe(evt codexEvent) {
 	}
 	if usage := usageFromResponse(evt.Response); usage != nil {
 		acc.usage = usage
+	}
+	if tier, ok := evt.Response["service_tier"].(string); ok && tier != "" {
+		acc.serviceTier = ptr(schemas.BifrostServiceTier(tier))
 	}
 }
 
@@ -282,13 +286,13 @@ func buildChatResponse(acc *chatAccumulator) *schemas.BifrostChatResponse {
 	if acc.sawFunction {
 		finish = "tool_calls"
 	}
-	out := &schemas.BifrostChatResponse{ID: acc.id, Object: "chat.completion", Created: acc.created, Model: acc.model, Choices: []schemas.BifrostResponseChoice{{Index: 0, FinishReason: ptr(finish), ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{Message: msg}}}, Usage: acc.usage}
+	out := &schemas.BifrostChatResponse{ID: acc.id, Object: "chat.completion", Created: acc.created, Model: acc.model, Choices: []schemas.BifrostResponseChoice{{Index: 0, FinishReason: ptr(finish), ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{Message: msg}}}, Usage: acc.usage, ServiceTier: acc.serviceTier}
 	attachChatWire(out)
 	return out
 }
 
 func chatStreamChunk(acc *chatAccumulator, delta *schemas.ChatStreamResponseChoiceDelta) *schemas.BifrostStreamChunk {
-	response := &schemas.BifrostChatResponse{ID: acc.id, Object: "chat.completion.chunk", Created: acc.created, Model: acc.model, Choices: []schemas.BifrostResponseChoice{{Index: 0, ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{Delta: delta}}}}
+	response := &schemas.BifrostChatResponse{ID: acc.id, Object: "chat.completion.chunk", Created: acc.created, Model: acc.model, Choices: []schemas.BifrostResponseChoice{{Index: 0, ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{Delta: delta}}}, ServiceTier: acc.serviceTier}
 	attachChatWire(response)
 	return &schemas.BifrostStreamChunk{BifrostChatResponse: response}
 }

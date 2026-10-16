@@ -79,6 +79,19 @@ def main():
                         raise AssertionError("Isolated Bifrost did not start")
 
                     auth = {"X-Bifrost-Setup-Token": token}
+                    # The health route can become ready before custom plugins
+                    # finish loading. Wait for the authenticated plugin route,
+                    # so startup timing cannot masquerade as a loader failure.
+                    for _ in range(60):
+                        assert process.poll() is None, "Isolated Bifrost exited while loading the plugin"
+                        status, kind, body = request("GET", "/chatgpt/status", auth)
+                        if status == 200:
+                            break
+                        assert status in (404, 503), ("Plugin readiness failed", status, kind, body)
+                        time.sleep(.5)
+                    else:
+                        raise AssertionError(("Plugin did not become ready", status, kind, body))
+
                     for path in ("/chatgpt/status", "/chatgpt/login", "/chatgpt/refresh", "/chatgpt/logout"):
                         for headers in ({}, {"x-bf-vk": "sk-bf-not-an-admin"}):
                             status, kind, _ = request("GET", path, headers)
