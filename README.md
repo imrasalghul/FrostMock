@@ -41,7 +41,9 @@ Download the matching host and plugin from the same [release](https://github.com
 
 Linux builds use Ubuntu 24.04 and require compatible glibc libraries. macOS builds use macOS 15 runners and are unsigned. Build from source if you need a different host environment.
 
-Pushing a `v*` tag publishes all four platform builds, licenses, and `SHA256SUMS` to GitHub Releases after every build passes. Main-branch pushes and manual workflow runs build and test the same assets without publishing a release; the binaries remain available as workflow artifacts.
+Create and publish a GitHub release with your chosen tag, title, and notes. The workflow builds the tagged source and uploads all four platform builds, licenses, and `SHA256SUMS` to that existing release after every build passes. It does not create releases or edit their metadata. Reruns replace assets with the same filenames.
+
+Main-branch pushes and manual runs with an empty `release_tag` only build and test; their binaries are available as workflow artifacts. To rebuild an existing release, run the workflow manually from `main` and enter its tag in `release_tag`. The source is checked out from that tag.
 
 ### Build from source
 

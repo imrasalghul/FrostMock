@@ -3,14 +3,20 @@ name: Build and release
 on:
   push:
     branches: [main]
-    tags: ['v*']
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to build and upload to (blank for build-only)'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag || github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -46,6 +52,7 @@ jobs:
       - name: Check out FrostMock
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.release_tag != '' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           persist-credentials: false
 
       - name: Check out matching Bifrost source
@@ -132,9 +139,9 @@ jobs:
           retention-days: 14
 
   release:
-    name: Publish release
+    name: Upload release assets
     needs: build
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -162,11 +169,10 @@ jobs:
           sha256sum ./* > SHA256SUMS
           sha256sum --check SHA256SUMS
 
-      - name: Publish tagged release
+      - name: Upload assets to existing release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
-          gh release create "$RELEASE_TAG" --verify-tag --generate-notes \
-            --title "$RELEASE_TAG" artifacts/*
+          gh release upload "$RELEASE_TAG" artifacts/* --clobber
