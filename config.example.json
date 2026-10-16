@@ -1,0 +1,54 @@
+{
+  "$comment": "Example Bifrost config.json fragment. Merge the `providers.chatgpt` block and the `plugins` entry into your existing Bifrost config. The provider block is what makes `chatgpt` a routable provider name; the plugin block is what actually implements it.",
+  "providers": {
+    "chatgpt": {
+      "keys": [
+        {
+          "name": "chatgpt-subscription",
+          "value": "unused-the-plugin-supplies-the-real-token",
+          "models": ["*"],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "https://chatgpt.com/backend-api/codex"
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai",
+        "allowed_requests": {
+          "list_models": true,
+          "chat_completion": true,
+          "chat_completion_stream": true,
+          "responses": true,
+          "responses_stream": true,
+          "text_completion": true,
+          "text_completion_stream": true,
+          "embedding": false,
+          "speech": false,
+          "speech_stream": false,
+          "transcription": false,
+          "transcription_stream": false
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "enabled": true,
+      "name": "chatgpt",
+      "path": "/home/bifrost/.bifrost/plugins/chatgpt.so",
+      "placement": "post_builtin",
+      "order": 0,
+      "config": {
+        "reasoning_effort": "medium",
+        "reasoning_summary": "auto",
+        "reasoning_compat": "think-tags",
+        "fast_mode": false,
+        "enable_web_search": false,
+        "expose_reasoning_models": false,
+        "model_sync": true,
+        "model_refresh_interval": 3600
+      }
+    }
+  ]
+}

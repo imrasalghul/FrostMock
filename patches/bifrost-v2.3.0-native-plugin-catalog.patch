@@ -1,0 +1,360 @@
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -21,6 +21,7 @@
+ 	bifrost "github.com/maximhq/bifrost/core"
+ 	"github.com/maximhq/bifrost/core/agent"
+ 	"github.com/maximhq/bifrost/core/network"
++	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
+ 	"github.com/maximhq/bifrost/core/schemas"
+ 	"github.com/maximhq/bifrost/framework/configstore"
+ 	"github.com/maximhq/bifrost/framework/configstore/tables"
+@@ -2184,7 +2185,7 @@
+ 		defer wg.Done()
+ 		bfCtx := newListModelsCtx()
+ 		defer bfCtx.Cancel()
+-		resp, bfErr := s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
++		resp, bfErr := s.listModelsForCatalog(bfCtx, &schemas.BifrostListModelsRequest{
+ 			Provider: provider,
+ 			KeyID:    keyIDPtr,
+ 		})
+@@ -2215,7 +2216,7 @@
+ 		defer wg.Done()
+ 		bfCtx := newListModelsCtx()
+ 		defer bfCtx.Cancel()
+-		resp, bfErr := s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
++		resp, bfErr := s.listModelsForCatalog(bfCtx, &schemas.BifrostListModelsRequest{
+ 			Provider:   provider,
+ 			KeyID:      keyIDPtr,
+ 			Unfiltered: true,
+@@ -3817,3 +3818,103 @@
+ 		s.skillsServingHandler.Close()
+ 	}
+ }
++
++// listModelsForCatalog lets a custom provider's owning native LLM plugin supply
++// its background catalog without enabling the global plugin pipeline. Existing
++// key status updates, filtering, and catalog generation checks stay in the caller.
++// This runs only during discovery and adds no work to the inference request path.
++func (s *BifrostHTTPServer) listModelsForCatalog(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
++	var plugins *[]schemas.BasePlugin
++	var selectedKey *schemas.Key
++	if s.Config != nil && req != nil {
++		if pc, err := s.Config.GetProviderConfigRaw(req.Provider); err == nil && pc != nil && pc.CustomProviderConfig != nil {
++			plugins = s.Config.BasePlugins.Load()
++			if req.KeyID != nil {
++				for _, key := range pc.Keys {
++					if key.ID == *req.KeyID && keyEnabled(key) {
++						selectedKey = &key
++						break
++					}
++				}
++				// Retain core's validation for a missing or disabled selected key.
++				if selectedKey == nil {
++					plugins = nil
++				}
++			}
++		}
++	}
++	resp, bfErr, owned := listModelsWithProviderPlugin(ctx, req, plugins, s.Client.ListModelsRequest)
++	if owned && resp != nil && selectedKey != nil {
++		resp = filterProviderPluginCatalog(resp, req, *selectedKey)
++	}
++	return resp, bfErr
++}
++
++// listModelsWithProviderPlugin uses the immutable plugin snapshot loaded by the
++// server. Exact name matching is deliberate: unrelated policy, governance, and
++// observability plugins must not receive an internal catalog refresh.
++func listModelsWithProviderPlugin(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest, plugins *[]schemas.BasePlugin, fallback func(*schemas.BifrostContext, *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError)) (*schemas.BifrostListModelsResponse, *schemas.BifrostError, bool) {
++	if req != nil && req.Provider != "" && plugins != nil {
++		for _, base := range *plugins {
++			if base == nil || base.GetName() != string(req.Provider) {
++				continue
++			}
++			plugin, ok := base.(schemas.LLMPlugin)
++			if !ok {
++				continue
++			}
++			// Keep the original request for ordinary provider fallback if the owning
++			// plugin declines to supply a list, rather than applying routing mutations.
++			pluginReq := *req
++			_, short, err := plugin.PreLLMHook(ctx, &schemas.BifrostRequest{RequestType: schemas.ListModelsRequest, ListModelsRequest: &pluginReq})
++			if err != nil {
++				// Hook errors are non-blocking, consistent with the normal plugin contract.
++				logger.Warn("provider catalog hook failed for plugin %s: %v", base.GetName(), err)
++				break
++			}
++			if short != nil {
++				if short.Error != nil {
++					return nil, short.Error, true
++				}
++				if short.Response != nil && short.Response.ListModelsResponse != nil {
++					return short.Response.ListModelsResponse, nil, true
++				}
++			}
++			break
++		}
++	}
++	resp, bfErr := fallback(ctx, req)
++	return resp, bfErr, false
++}
++
++// The composed model catalog trusts filtered live responses, so plugin lists
++// need the same key policy that provider converters normally apply. Reuse that
++// shared pipeline, preserving aliases, explicit-model backfill, and metadata.
++// Copy the response because a plugin may share its catalog across both calls.
++func filterProviderPluginCatalog(resp *schemas.BifrostListModelsResponse, req *schemas.BifrostListModelsRequest, key schemas.Key) *schemas.BifrostListModelsResponse {
++	filtered := *resp
++	filtered.Data = make([]schemas.Model, 0, len(resp.Data))
++	pipeline := &providerUtils.ListModelsPipeline{AllowedModels: key.Models, BlacklistedModels: key.BlacklistedModels, Aliases: key.Aliases, Unfiltered: req.Unfiltered, ProviderKey: req.Provider, MatchFns: providerUtils.DefaultMatchFns()}
++	if pipeline.ShouldEarlyExit() {
++		return &filtered
++	}
++	included := make(map[string]bool, len(resp.Data))
++	for _, model := range resp.Data {
++		provider, _ := schemas.ParseModelString(model.ID, "")
++		id := strings.TrimPrefix(model.ID, string(req.Provider)+"/")
++		if provider != "" && provider != req.Provider {
++			continue
++		}
++		for _, result := range pipeline.FilterModel(id) {
++			entry := model
++			entry.ID = string(req.Provider) + "/" + result.ResolvedID
++			if result.AliasValue != "" {
++				entry.Alias = schemas.Ptr(result.AliasValue)
++			}
++			filtered.Data = append(filtered.Data, entry)
++			included[strings.ToLower(result.ResolvedID)] = true
++		}
++	}
++	filtered.Data = append(filtered.Data, pipeline.BackfillModels(included)...)
++	return &filtered
++}
+diff --git a/transports/bifrost-http/server/listmodels_test.go b/transports/bifrost-http/server/listmodels_test.go
+--- a/transports/bifrost-http/server/listmodels_test.go
++++ b/transports/bifrost-http/server/listmodels_test.go
+@@ -2,11 +2,14 @@
+ 
+ import (
+ 	"context"
++	"errors"
++	"reflect"
+ 	"testing"
+ 	"time"
+ 
+ 	bifrost "github.com/maximhq/bifrost/core"
+ 	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
+ 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+ )
+ 
+@@ -44,3 +47,208 @@
+ 
+ 	s.NarrowListModelsProviders(nil)
+ }
++
++// The provider catalog adapter must never invoke governance, routing, or post hooks.
++type catalogAdapterPlugin struct {
++	name string
++	pre  func(*schemas.BifrostContext, *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error)
++}
++
++func (p *catalogAdapterPlugin) GetName() string { return p.name }
++func (p *catalogAdapterPlugin) Cleanup() error  { return nil }
++func (p *catalogAdapterPlugin) PreRequestHook(*schemas.BifrostContext, *schemas.BifrostRequest) error {
++	panic("catalog must not run request hooks")
++}
++func (p *catalogAdapterPlugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
++	return p.pre(ctx, req)
++}
++func (p *catalogAdapterPlugin) PostLLMHook(*schemas.BifrostContext, *schemas.BifrostResponse, *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
++	panic("catalog must not run post hooks")
++}
++
++type catalogAdapterBasePlugin struct{ name string }
++
++func (p catalogAdapterBasePlugin) GetName() string { return p.name }
++func (p catalogAdapterBasePlugin) Cleanup() error  { return nil }
++
++func TestCatalogProviderPluginListsModelsWithoutGlobalPipeline(t *testing.T) {
++	for _, unfiltered := range []bool{false, true} {
++		t.Run(map[bool]string{false: "filtered", true: "unfiltered"}[unfiltered], func(t *testing.T) {
++			ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
++			defer ctx.Cancel()
++			ctx.SetValue(schemas.BifrostContextKeySkipPluginPipeline, true)
++			keyID := "subscription-key"
++			req := &schemas.BifrostListModelsRequest{Provider: "subscription", KeyID: &keyID, Unfiltered: unfiltered, PageSize: 17, PageToken: "cursor"}
++			want := &schemas.BifrostListModelsResponse{Data: []schemas.Model{{ID: "subscription/live-model"}}, KeyStatuses: []schemas.KeyStatus{{KeyID: keyID, Provider: "subscription", Status: "success"}}}
++			calls := 0
++			owner := &catalogAdapterPlugin{name: "subscription", pre: func(gotCtx *schemas.BifrostContext, got *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
++				calls++
++				if gotCtx != ctx || got.RequestType != schemas.ListModelsRequest || !reflect.DeepEqual(got.ListModelsRequest, req) {
++					t.Fatalf("catalog hook received wrong request: %+v", got)
++				}
++				return nil, &schemas.LLMPluginShortCircuit{Response: &schemas.BifrostResponse{ListModelsResponse: want}}, nil
++			}}
++			forbidden := &catalogAdapterPlugin{name: "governance", pre: func(*schemas.BifrostContext, *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
++				t.Fatal("global governance hook ran")
++				return nil, nil, nil
++			}}
++			plugins := []schemas.BasePlugin{forbidden, catalogAdapterBasePlugin{name: "subscription"}, owner}
++			fallback := func(*schemas.BifrostContext, *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
++				t.Error("generic provider called for owned catalog")
++				return nil, nil
++			}
++			got, bfErr, _ := listModelsWithProviderPlugin(ctx, req, &plugins, fallback)
++			if got != want || bfErr != nil || calls != 1 {
++				t.Fatalf("catalog response=%+v error=%v calls=%d", got, bfErr, calls)
++			}
++			if ctx.Value(schemas.BifrostContextKeySkipPluginPipeline) != true {
++				t.Fatal("catalog enabled the global pipeline")
++			}
++		})
++	}
++}
++
++func TestCatalogProviderPluginFallthroughAndErrors(t *testing.T) {
++	SetLogger(bifrost.NewNoOpLogger())
++	denied := &schemas.BifrostError{Error: &schemas.ErrorField{Message: "catalog denied"}, ExtraFields: schemas.BifrostErrorExtraFields{KeyStatuses: []schemas.KeyStatus{{KeyID: "key", Status: schemas.KeyStatusListModelsFailed}}}}
++	fallbackError := &schemas.BifrostError{Error: &schemas.ErrorField{Message: "ordinary provider error"}}
++	for _, tc := range []struct {
++		name, pluginName string
++		short            *schemas.LLMPluginShortCircuit
++		hookError        error
++		wantDenied       bool
++		noPlugins        bool
++		emptyProvider    bool
++	}{
++		{name: "short-circuit error", pluginName: "subscription", short: &schemas.LLMPluginShortCircuit{Error: denied}, wantDenied: true},
++		{name: "unhandled", pluginName: "subscription"},
++		{name: "empty short circuit", pluginName: "subscription", short: &schemas.LLMPluginShortCircuit{}},
++		{name: "different response type", pluginName: "subscription", short: &schemas.LLMPluginShortCircuit{Response: &schemas.BifrostResponse{}}},
++		{name: "hook error is nonblocking", pluginName: "subscription", hookError: errors.New("hook unavailable")},
++		{name: "other provider", pluginName: "another-provider"},
++		{name: "provider prefix is not a match", pluginName: "subscription-extra"},
++		{name: "provider matching is exact", pluginName: "Subscription"},
++		{name: "no eligible plugins", noPlugins: true},
++		{name: "empty provider", pluginName: "", emptyProvider: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
++			defer ctx.Cancel()
++			key := "key"
++			req := &schemas.BifrostListModelsRequest{Provider: "subscription", KeyID: &key, Unfiltered: true}
++			if tc.emptyProvider {
++				req.Provider = ""
++			}
++			calls := 0
++			plugin := &catalogAdapterPlugin{name: tc.pluginName, pre: func(*schemas.BifrostContext, *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
++				calls++
++				return &schemas.BifrostRequest{}, tc.short, tc.hookError
++			}}
++			plugins := []schemas.BasePlugin{plugin}
++			var eligible *[]schemas.BasePlugin
++			if !tc.noPlugins {
++				eligible = &plugins
++			}
++			fallbackCalls := 0
++			fallback := func(gotCtx *schemas.BifrostContext, got *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
++				fallbackCalls++
++				if gotCtx != ctx || got != req {
++					t.Fatal("ordinary provider lost original context or request")
++				}
++				return nil, fallbackError
++			}
++			got, bfErr, _ := listModelsWithProviderPlugin(ctx, req, eligible, fallback)
++			if tc.wantDenied {
++				if got != nil || bfErr != denied || fallbackCalls != 0 || calls != 1 {
++					t.Fatalf("short-circuit error lost: got=%v error=%v fallback=%d hooks=%d", got, bfErr, fallbackCalls, calls)
++				}
++			} else {
++				if got != nil || bfErr != fallbackError || fallbackCalls != 1 {
++					t.Fatalf("ordinary fallback changed: response=%v error=%v calls=%d", got, bfErr, fallbackCalls)
++				}
++				if (tc.noPlugins || tc.emptyProvider || tc.pluginName != "subscription") && calls != 0 {
++					t.Fatalf("unmatched plugin executed %d times", calls)
++				}
++			}
++		})
++	}
++}
++
++func TestCatalogProviderPluginAppliesKeyModelPolicyWithoutMutatingSharedResponse(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		key        schemas.Key
++		unfiltered bool
++		want       []string
++		alias      string
++	}{
++		{name: "allowlist aliases and blacklist", key: schemas.Key{Models: schemas.WhiteList{"alias", "manual"}, BlacklistedModels: schemas.BlackList{"manual"}, Aliases: schemas.KeyAliases{"alias": {ModelID: "live-a"}}}, want: []string{"subscription/alias"}, alias: "live-a"},
++		{name: "wildcard blacklist", key: schemas.Key{Models: schemas.WhiteList{"*"}, BlacklistedModels: schemas.BlackList{"live-b"}}, want: []string{"subscription/live-a"}},
++		{name: "empty allowlist denies all", key: schemas.Key{}, want: []string{}},
++		{name: "regex whitelist", key: schemas.Key{Models: schemas.WhiteList{"regex:live-a"}}, want: []string{"subscription/live-a"}},
++		{name: "configured model backfill", key: schemas.Key{Models: schemas.WhiteList{"manual"}}, want: []string{"subscription/manual"}},
++		{name: "unfiltered ignores allow and block", key: schemas.Key{BlacklistedModels: schemas.BlackList{"*"}}, unfiltered: true, want: []string{"subscription/live-a", "subscription/live-b"}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			contextLength := 12345
++			original := &schemas.BifrostListModelsResponse{Data: []schemas.Model{{ID: "subscription/live-a", ContextLength: &contextLength}, {ID: "subscription/live-b"}, {ID: "openai/foreign-model"}}, KeyStatuses: []schemas.KeyStatus{{KeyID: "key", Provider: "subscription", Status: schemas.KeyStatusSuccess}}}
++			req := &schemas.BifrostListModelsRequest{Provider: "subscription", Unfiltered: tc.unfiltered}
++			got := filterProviderPluginCatalog(original, req, tc.key)
++			ids := make([]string, 0, len(got.Data))
++			for _, m := range got.Data {
++				ids = append(ids, m.ID)
++			}
++			if !reflect.DeepEqual(ids, tc.want) {
++				t.Fatalf("filtered IDs=%v want %v", ids, tc.want)
++			}
++			if len(original.Data) != 3 || original.Data[0].ID != "subscription/live-a" {
++				t.Fatal("key policy mutated shared plugin response")
++			}
++			if len(got.KeyStatuses) != 1 || got.KeyStatuses[0].Status != schemas.KeyStatusSuccess {
++				t.Fatal("filter discarded key statuses")
++			}
++			if tc.alias != "" && (got.Data[0].Alias == nil || *got.Data[0].Alias != tc.alias || got.Data[0].ContextLength != &contextLength) {
++				t.Fatalf("alias lost source metadata: %+v", got.Data[0])
++			}
++		})
++	}
++}
++
++// The background entry point must load BasePlugins and key policy from the same
++// custom-provider config used by live catalog refresh, rather than its LLM cache.
++func TestCatalogProviderPluginServerLoadsAtomicSnapshotAndSelectedKeyPolicy(t *testing.T) {
++	keyID := "subscription-key"
++	key := schemas.Key{ID: keyID, Models: schemas.WhiteList{"live-a"}}
++	cfg := &lib.Config{Providers: map[schemas.ModelProvider]configstore.ProviderConfig{"subscription": {Keys: []schemas.Key{key}, CustomProviderConfig: &schemas.CustomProviderConfig{}}}}
++	want := &schemas.BifrostListModelsResponse{Data: []schemas.Model{{ID: "subscription/live-a"}, {ID: "subscription/live-b"}}, KeyStatuses: []schemas.KeyStatus{{KeyID: keyID, Provider: "subscription", Status: schemas.KeyStatusSuccess}}}
++	calls := 0
++	owner := &catalogAdapterPlugin{name: "subscription", pre: func(_ *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
++		calls++
++		if req.RequestType != schemas.ListModelsRequest || req.ListModelsRequest.KeyID == nil || *req.ListModelsRequest.KeyID != keyID {
++			t.Fatalf("wrong native catalog request: %+v", req)
++		}
++		return nil, &schemas.LLMPluginShortCircuit{Response: &schemas.BifrostResponse{ListModelsResponse: want}}, nil
++	}}
++	plugins := []schemas.BasePlugin{owner}
++	cfg.BasePlugins.Store(&plugins)
++	server := &BifrostHTTPServer{Config: cfg}
++	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
++	defer ctx.Cancel()
++	ctx.SetValue(schemas.BifrostContextKeySkipPluginPipeline, true)
++	for _, unfiltered := range []bool{false, true} {
++		got, bfErr := server.listModelsForCatalog(ctx, &schemas.BifrostListModelsRequest{Provider: "subscription", KeyID: &keyID, Unfiltered: unfiltered})
++		if bfErr != nil || got == nil {
++			t.Fatalf("native listing error=%v response=%v", bfErr, got)
++		}
++		expected := 1
++		if unfiltered {
++			expected = 2
++		}
++		if len(got.Data) != expected || len(got.KeyStatuses) != 1 || got.KeyStatuses[0].KeyID != keyID {
++			t.Fatalf("native catalog response=%+v unfiltered=%v", got, unfiltered)
++		}
++	}
++	if calls != 2 || len(want.Data) != 2 {
++		t.Fatalf("hook calls=%d shared models=%d", calls, len(want.Data))
++	}
++}

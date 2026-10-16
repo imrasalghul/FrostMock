@@ -1,0 +1,172 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: '1.27.0'
+  BIFROST_COMMIT: '9237ec06672406e437b3cb33fc793ffd0403b3ae'
+  CGO_ENABLED: '1'
+  GOWORK: 'off'
+  GOTOOLCHAIN: local
+  GOMAXPROCS: '3'
+  GOFLAGS: '-p=2'
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+          - runner: macos-15-intel
+            target: darwin-amd64
+          - runner: macos-15
+            target: darwin-arm64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out FrostMock
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out matching Bifrost source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maximhq/bifrost
+          ref: ${{ env.BIFROST_COMMIT }}
+          path: build/bifrost
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            go.sum
+            build/bifrost/transports/go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '25'
+          cache: npm
+          cache-dependency-path: build/bifrost/ui/package-lock.json
+
+      - name: Verify native toolchain and patch Bifrost
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+          test "$(go env GOOS)-$(go env GOARCH)" = "$TARGET"
+          git -C build/bifrost apply --check "$GITHUB_WORKSPACE/patches/"*.patch
+          git -C build/bifrost apply "$GITHUB_WORKSPACE/patches/"*.patch
+
+      - name: Build Bifrost dashboard
+        working-directory: build/bifrost/ui
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Test FrostMock and patched Bifrost
+        run: |
+          go test -race -trimpath -tags=netgo,osusergo,sqlite_static ./... -count=1
+          go vet ./...
+          cd build/bifrost/transports
+          go test -trimpath -tags=netgo,osusergo,sqlite_static ./bifrost-http/server -count=1
+
+      - name: Build matching host, plugin, and login helper
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p build/dist
+          output="$GITHUB_WORKSPACE/build/dist"
+          flags=(-trimpath -tags=netgo,osusergo,sqlite_static)
+          go build "${flags[@]}" -buildmode=plugin -o "$output/frostmock-$TARGET.so" .
+          go build "${flags[@]}" -o "$output/frostmock-login-$TARGET" .
+          cd build/bifrost/transports/bifrost-http
+          go build "${flags[@]}" -ldflags='-w -s -X main.Version=v2.3.0' \
+            -o "$output/bifrost-$TARGET" .
+
+      - name: Verify real Bifrost can load FrostMock
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 tools/verify_auth_routes.py \
+            --binary "build/dist/bifrost-$TARGET" \
+            --plugin "build/dist/frostmock-$TARGET.so"
+
+      - name: Include licenses
+        if: matrix.target == 'linux-amd64'
+        run: |
+          cp LICENSE build/dist/LICENSE-FrostMock
+          cp build/bifrost/LICENSE build/dist/LICENSE-Bifrost
+          cp build/bifrost/THIRD_PARTY_NOTICES.md build/dist/THIRD_PARTY_NOTICES-Bifrost.md
+
+      - name: Upload tested binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frostmock-${{ matrix.target }}
+          path: build/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download all tested binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: frostmock-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify asset set and generate checksums
+        shell: bash
+        run: |
+          for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            test -s "artifacts/bifrost-$target"
+            test -s "artifacts/frostmock-$target.so"
+            test -s "artifacts/frostmock-login-$target"
+          done
+          test -s artifacts/LICENSE-FrostMock
+          test -s artifacts/LICENSE-Bifrost
+          test -s artifacts/THIRD_PARTY_NOTICES-Bifrost.md
+          cd artifacts
+          sha256sum ./* > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes \
+            --title "$RELEASE_TAG" artifacts/*

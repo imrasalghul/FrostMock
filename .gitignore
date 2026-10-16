@@ -1,0 +1,10 @@
+.vscode/
+build/
+*.so
+*.dylib
+*.exe
+auth.json
+chatmock_models_cache.json
+.env
+.env.*
+*.log

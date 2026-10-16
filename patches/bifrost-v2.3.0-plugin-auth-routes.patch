@@ -1,0 +1,59 @@
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -3026,6 +3026,7 @@
+ 		metricsAdapter(ctx)
+ 	}
+ 	s.Router.GET("/metrics", lib.ChainMiddlewares(metricsHandler, middlewares...))
++	s.registerChatGPTAuthRoutes(middlewares...)
+ 	// 404 handler
+ 	s.Router.NotFound = func(ctx *fasthttp.RequestCtx) {
+ 		handlers.SendError(ctx, fasthttp.StatusNotFound, "Route not found: "+string(ctx.Path()))
+diff --git a/transports/bifrost-http/server/plugin_auth_routes.go b/transports/bifrost-http/server/plugin_auth_routes.go
+new file mode 100644
+--- /dev/null
++++ b/transports/bifrost-http/server/plugin_auth_routes.go
+@@ -0,0 +1,43 @@
++package server
++
++import (
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/transports/bifrost-http/handlers"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// registerChatGPTAuthRoutes bridges the subscription plugin's auth hooks into
++// the router. Transport hooks alone do not register routes: unknown GETs would
++// otherwise fall through to the dashboard's SPA handler. These operations use
++// the management auth chain, including session cookies and the OSS setup lock;
++// an inference virtual key must not grant control over the shared account.
++func (s *BifrostHTTPServer) registerChatGPTAuthRoutes(middlewares ...schemas.BifrostHTTPMiddleware) {
++	dispatch := handlers.TransportInterceptorMiddleware(s.Config)(func(ctx *fasthttp.RequestCtx) {
++		handlers.SendError(ctx, fasthttp.StatusNotFound, "ChatGPT auth plugin is unavailable")
++	})
++	for _, route := range []struct{ path, method string }{
++		{"/chatgpt/status", fasthttp.MethodGet},
++		{"/chatgpt/login", fasthttp.MethodPost},
++		{"/chatgpt/refresh", fasthttp.MethodPost},
++		{"/chatgpt/logout", fasthttp.MethodPost},
++	} {
++		handler := lib.ChainMiddlewares(func(ctx *fasthttp.RequestCtx) {
++			if bypassed, _ := ctx.UserValue(schemas.BifrostContextKeyAuthBypassed).(bool); bypassed {
++				handlers.SendError(ctx, fasthttp.StatusForbidden, "ChatGPT account management requires dashboard authentication")
++				return
++			}
++			if string(ctx.Method()) != route.method {
++				ctx.Response.Header.Set("Allow", route.method)
++				handlers.SendError(ctx, fasthttp.StatusMethodNotAllowed, route.method+" required")
++				return
++			}
++			dispatch(ctx)
++		}, middlewares...)
++		// Explicit methods take precedence over the UI's GET catch-all. A router
++		// wildcard-method registration alone does not, and still serves HTML.
++		for _, method := range []string{fasthttp.MethodGet, fasthttp.MethodPost, fasthttp.MethodPut, fasthttp.MethodPatch, fasthttp.MethodDelete, fasthttp.MethodHead, fasthttp.MethodOptions, fasthttp.MethodConnect, fasthttp.MethodTrace} {
++			s.Router.Handle(method, route.path, handler)
++		}
++	}
++}

@@ -1,0 +1,677 @@
+{
+  "reference": "ChatMock 5bd6e77",
+  "source_sha256": "8e105e16d14e7c4401aaa55c048b9dabc3ba8ad2fe9b4199d4a1b8aa3d58cabf",
+  "messages": [
+    {
+      "name": "developer",
+      "messages": [
+        {
+          "role": "developer",
+          "content": "Follow this rule"
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "expected": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Follow this rule"
+            }
+          ]
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Hello"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "system_order",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "system",
+          "content": "System rule"
+        },
+        {
+          "role": "system",
+          "content": "second system"
+        }
+      ],
+      "expected": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "System rule"
+            }
+          ]
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Hello"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool_blocks",
+      "messages": [
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": [
+            {
+              "type": "text",
+              "text": "first"
+            },
+            {
+              "type": "text",
+              "text": "second"
+            }
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "type": "function_call_output",
+          "call_id": "call_1",
+          "output": "first\nsecond"
+        }
+      ]
+    },
+    {
+      "name": "empty_tool_result",
+      "messages": [
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": ""
+        }
+      ],
+      "expected": [
+        {
+          "type": "function_call_output",
+          "call_id": "call_1",
+          "output": ""
+        }
+      ]
+    },
+    {
+      "name": "vision",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Describe"
+            },
+            {
+              "type": "image_url",
+              "image_url": {
+                "url": "data:image/png;base64,/w%3D%3D"
+              }
+            }
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Describe"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,/w=="
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "assistant_tools",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": "Checking",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "arguments": "{\"q\":\"hello\"}"
+              }
+            }
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "type": "function_call",
+          "name": "lookup",
+          "arguments": "{\"q\":\"hello\"}",
+          "call_id": "call_1"
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "Checking"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "tools": {
+    "input": [
+      {
+        "type": "function",
+        "function": {
+          "name": "lookup",
+          "description": "Find a record",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "q": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "ping"
+        }
+      }
+    ],
+    "expected": [
+      {
+        "type": "function",
+        "name": "lookup",
+        "description": "Find a record",
+        "strict": false,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "ping",
+        "description": "",
+        "strict": false,
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    ]
+  },
+  "streams": [
+    {
+      "mode": "think-tags",
+      "events": [
+        {
+          "type": "response.reasoning_summary_part.added"
+        },
+        {
+          "type": "response.reasoning_summary_text.delta",
+          "delta": "first"
+        },
+        {
+          "type": "response.reasoning_summary_part.added"
+        },
+        {
+          "type": "response.reasoning_summary_text.delta",
+          "delta": "second"
+        },
+        {
+          "type": "response.output_text.delta",
+          "delta": "answer"
+        },
+        {
+          "type": "response.output_text.done",
+          "text": "answer"
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "response_1",
+            "usage": {
+              "input_tokens": 5,
+              "output_tokens": 3
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "<think>"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "first"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "\n"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "second"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "</think>"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "answer"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "response_1",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        {
+          "id": "response_1",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": null
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      ]
+    },
+    {
+      "mode": "o3",
+      "events": [
+        {
+          "type": "response.reasoning_summary_part.added"
+        },
+        {
+          "type": "response.reasoning_summary_text.delta",
+          "delta": "first"
+        },
+        {
+          "type": "response.reasoning_summary_part.added"
+        },
+        {
+          "type": "response.reasoning_summary_text.delta",
+          "delta": "second"
+        },
+        {
+          "type": "response.output_text.delta",
+          "delta": "answer"
+        },
+        {
+          "type": "response.output_text.done",
+          "text": "answer"
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "response_1",
+            "usage": {
+              "input_tokens": 5,
+              "output_tokens": 3
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": {
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "first"
+                    }
+                  ]
+                }
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": {
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "\n"
+                    }
+                  ]
+                }
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": {
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "second"
+                    }
+                  ]
+                }
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "answer"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "response_1",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        {
+          "id": "response_1",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": null
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      ]
+    },
+    {
+      "mode": "legacy",
+      "events": [
+        {
+          "type": "response.reasoning_summary_part.added"
+        },
+        {
+          "type": "response.reasoning_summary_text.delta",
+          "delta": "first"
+        },
+        {
+          "type": "response.reasoning_summary_part.added"
+        },
+        {
+          "type": "response.reasoning_summary_text.delta",
+          "delta": "second"
+        },
+        {
+          "type": "response.output_text.delta",
+          "delta": "answer"
+        },
+        {
+          "type": "response.output_text.done",
+          "text": "answer"
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "response_1",
+            "usage": {
+              "input_tokens": 5,
+              "output_tokens": 3
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_summary": "first",
+                "reasoning": "first"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_summary": "second",
+                "reasoning": "second"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-stream",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "answer"
+              },
+              "finish_reason": null
+            }
+          ]
+        },
+        {
+          "id": "response_1",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        {
+          "id": "response_1",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-5.4",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": null
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      ]
+    }
+  ]
+}
