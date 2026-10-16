@@ -24,6 +24,75 @@ func TestCatalogVisibleModelsSortByPriority(t *testing.T) {
 	}
 }
 
+// The upstream catalog gates newer models by the requested client version.
+// Entitled models must be discovered without a local slug allowlist.
+func TestCatalogDiscoveryUsesCurrentVersionAndAccountEntitlements(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("client_version") != "0.163.0" {
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.6-sol","visibility":"list"}]}`)
+			return
+		}
+		models := []map[string]any{{"slug": "gpt-6.1-sol", "visibility": "list"}, {"slug": "gpt-6-astra", "visibility": "list"}, {"slug": "gpt-6-sol", "visibility": "list"}, {"slug": "gpt-6-luna", "visibility": "list"}}
+		if r.Header.Get("ChatGPT-Account-ID") == "daybreak-account" {
+			models = append(models, map[string]any{"slug": "gpt-5.6-cyber", "visibility": "list"})
+		}
+		models = append(models, map[string]any{"slug": "internal-model", "visibility": "hide"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"models": models})
+	}))
+	defer server.Close()
+	account := "daybreak-account"
+	c := &modelCatalog{endpoint: server.URL, cacheFile: filepath.Join(t.TempDir(), "cache.json"), installation: func() string { return "test" }, accountID: func() string { return account }, credentials: func(bool) (string, string, error) { return "fake", account, nil }}
+	want := []string{"gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-cyber"}
+	if !c.refresh() || !reflect.DeepEqual(c.slugs(), want) {
+		t.Fatalf("entitled discovery = %v, want %v", c.slugs(), want)
+	}
+	account = "standard-account"
+	if !c.refresh() || !reflect.DeepEqual(c.slugs(), want[:4]) {
+		t.Fatalf("standard account discovery = %v; must not retain Daybreak models", c.slugs())
+	}
+}
+
+func TestCatalogCacheClientVersionControlsFreshness(t *testing.T) {
+	for _, version := range []string{"0.163.0", "0.146.0", ""} {
+		t.Run(version, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cache.json")
+			body, _ := json.Marshal(map[string]any{"account_id": "account", "client_version": version, "fetched_at": time.Now().UTC().Format(time.RFC3339Nano), "models": []map[string]any{{"slug": "cached", "visibility": "list"}}})
+			if err := os.WriteFile(path, body, 0600); err != nil {
+				t.Fatal(err)
+			}
+			c := &modelCatalog{cacheFile: path, accountID: func() string { return "account" }}
+			c.loadCache()
+			if !reflect.DeepEqual(c.slugs(), []string{"cached"}) {
+				t.Fatal("same-account stale cache should remain available during refresh")
+			}
+			if stale := c.fetchedAt.IsZero(); stale != (version != "0.163.0") {
+				t.Fatalf("cache version %q stale=%v", version, stale)
+			}
+		})
+	}
+}
+
+func TestCatalogStartRefreshesOldClientCacheImmediately(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.json")
+	body, _ := json.Marshal(map[string]any{"account_id": "account", "client_version": "0.146.0", "fetched_at": time.Now().UTC().Format(time.RFC3339Nano), "models": []map[string]any{{"slug": "old-model", "visibility": "list"}}})
+	if err := os.WriteFile(path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"models":[{"slug":"new-model","visibility":"list"}]}`)
+	}))
+	defer server.Close()
+	c := &modelCatalog{endpoint: server.URL, cacheFile: path, installation: func() string { return "test" }, accountID: func() string { return "account" }, credentials: func(bool) (string, string, error) { return "fake", "account", nil }}
+	c.start()
+	defer c.stop()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	c.waitReady(ctx)
+	if got := c.slugs(); !reflect.DeepEqual(got, []string{"new-model"}) {
+		t.Fatalf("startup kept old-version cache instead of discovering immediately: %v", got)
+	}
+}
+
 // Dropping fields or mishandling heterogeneous entries loses live capabilities.
 func TestCatalogMetadataParsing(t *testing.T) {
 	models := parseCatalogModels([]byte(`{"models":[null,7,{"slug":"  model  ","supported_reasoning_levels":[" low ",{"effort":"high"},"low",null],"service_tiers":["default",{"id":"priority"}],"supported_in_api":true},{"slug":" "}]}`))
@@ -71,7 +140,7 @@ func TestCatalogRefreshRetriesUnauthorizedAndKeepsStaleOnFailure(t *testing.T) {
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		if r.URL.Query().Get("client_version") != "0.146.0" || r.Header.Get("ChatGPT-Account-ID") != "test-account" || r.Header.Get("originator") != "chatmock" {
+		if r.URL.Query().Get("client_version") != codexModelsClientVersion || r.Header.Get("ChatGPT-Account-ID") != "test-account" || r.Header.Get("originator") != "chatmock" {
 			t.Error("missing catalog request metadata")
 		}
 		if calls == 1 {

@@ -13,7 +13,9 @@ import (
 	"time"
 )
 
-const codexModelsClientVersion = "0.146.0"
+// Model discovery is version-gated upstream. Keep this aligned with a verified
+// Codex release: https://github.com/openai/codex/releases/tag/rust-v0.163.0.
+const codexModelsClientVersion = "0.163.0"
 
 // catalogModel retains capabilities for every upstream slug, including models
 // hidden from listing that can still be addressed explicitly.
@@ -366,10 +368,11 @@ func (c *modelCatalog) loadCache() {
 		return
 	}
 	var payload struct {
-		AccountID string            `json:"account_id"`
-		Models    []json.RawMessage `json:"models"`
-		FetchedAt string            `json:"fetched_at"`
-		ETag      string            `json:"etag"`
+		AccountID     string            `json:"account_id"`
+		ClientVersion string            `json:"client_version"`
+		Models        []json.RawMessage `json:"models"`
+		FetchedAt     string            `json:"fetched_at"`
+		ETag          string            `json:"etag"`
 	}
 	if json.Unmarshal(b, &payload) != nil {
 		return
@@ -383,6 +386,11 @@ func (c *modelCatalog) loadCache() {
 		return
 	}
 	fetchedAt, _ := time.Parse(time.RFC3339Nano, payload.FetchedAt)
+	// Retain same-account models as an outage fallback, but do not let a fresh
+	// cache from an older client delay discovery of newly available models.
+	if payload.ClientVersion != codexModelsClientVersion {
+		fetchedAt = time.Time{}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.modelsV = models

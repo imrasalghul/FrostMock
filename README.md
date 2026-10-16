@@ -140,6 +140,10 @@ curl http://localhost:8080/v1/chat/completions \
 
 Native Responses and text completions use Bifrost's standard `/v1/responses` and `/v1/completions` routes. Model availability depends on the signed-in account. Keep `list_models` enabled in the provider configuration to populate Bifrost's native catalog.
 
+Model discovery uses the account's live Codex catalog, including new models and Daybreak models when upstream lists them for that account. It does not merge a global Daybreak list into every account. OpenAI's [Codex model documentation](https://learn.chatgpt.com/docs/models) and [Daybreak documentation](https://developers.openai.com/api/docs/guides/daybreak) describe model availability and access requirements.
+
+Codex filters discovery by client version. FrostMock currently requests the catalog using verified Codex release `0.163.0`. After an upgrade changes that version, an older cached catalog is refreshed immediately; its same-account entries remain available if discovery temporarily fails.
+
 ## Configuration
 
 Options belong in the plugin's `config` object. See [config.example.json](config.example.json) for a complete example.
