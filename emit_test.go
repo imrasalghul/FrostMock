@@ -300,6 +300,72 @@ func TestEmissionNativeResponsesKeepUnknownWireFields(t *testing.T) {
 	}
 }
 
+func TestEmissionNativeResponsesRecoverCompletedItems(t *testing.T) {
+	// Codex can send complete items separately and omit them from the terminal
+	// response. Preserve the native items, including fields Bifrost doesn't know.
+	reasoning := `{"id":"rs-1","type":"reasoning","summary":[],"encrypted_content":"opaque"}`
+	search := `{"id":"ws-1","type":"web_search_call","status":"completed","action":{"type":"search","query":"go"}}`
+	message := `{"id":"msg-1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Answer","annotations":[{"type":"url_citation","start_index":0,"end_index":6,"url":"https://go.dev/","title":"Go"}],"future_field":true}]}`
+	recovered := "[" + reasoning + "," + search + "," + message + "]"
+	for _, tc := range []struct {
+		name, output, want string
+	}{
+		{"empty", `,"output":[]`, recovered},
+		{"absent", "", recovered},
+		{"null", `,"output":null`, recovered},
+		{"authoritative", `,"output":[` + message + `]`, "[" + message + "]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{
+				`{"type":"response.output_item.done","output_index":2,"item":` + message + `}`,
+				`{"type":"response.output_item.done","output_index":0,"item":` + reasoning + `}`,
+				`{"type":"response.output_item.done","output_index":1,"item":` + search + `}`,
+				`{"type":"response.output_item.done","output_index":1,"item":` + search + `}`,
+				`{"type":"response.output_item.added","output_index":3,"item":{"id":"unfinished","type":"message","role":"assistant","content":[]}}`,
+				`{"type":"response.completed","response":{"id":"resp-1","object":"response","status":"completed","service_tier":"default","future_field":true` + tc.output + `}}`,
+			}
+			check := func(raw map[string]any) {
+				t.Helper()
+				var want any
+				if err := json.Unmarshal([]byte(tc.want), &want); err != nil {
+					t.Fatal(err)
+				}
+				if canonicalJSON(raw["output"]) != canonicalJSON(want) {
+					t.Errorf("output = %s; want %s", canonicalJSON(raw["output"]), canonicalJSON(want))
+				}
+				if raw["service_tier"] != "default" || raw["future_field"] != true {
+					t.Error("terminal response metadata changed")
+				}
+			}
+			response, failure := aggregateResponses(emissionResponse(events...))
+			if failure != nil {
+				t.Fatal(failure)
+			}
+			check(response.ExtraFields.RawResponse.(map[string]any))
+			if len(response.Output) == 0 {
+				t.Error("typed response output is empty")
+			}
+			ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+			ch := make(chan *schemas.BifrostStreamChunk, 64)
+			streamResponsesChunks(ctx, ch, emissionResponse(events...))
+			var terminal *schemas.BifrostResponsesStreamResponse
+			for chunk := range ch {
+				if chunk.BifrostError != nil {
+					t.Fatal(chunk.BifrostError)
+				}
+				terminal = chunk.BifrostResponsesStreamResponse
+			}
+			if terminal == nil || terminal.Type != "response.completed" {
+				t.Fatal("missing completed event")
+			}
+			check(terminal.ExtraFields.RawResponse.(map[string]any)["response"].(map[string]any))
+			if terminal.Response == nil || len(terminal.Response.Output) == 0 {
+				t.Error("typed terminal output is empty")
+			}
+		})
+	}
+}
+
 func TestEmissionNormalizedToolArgumentsUseChatMockJSON(t *testing.T) {
 	for _, tc := range []struct {
 		arguments any

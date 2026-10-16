@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/maximhq/bifrost/core/schemas"
+	"sort"
 	"strings"
 	"time"
 )
@@ -541,12 +542,54 @@ func (acc *chatAccumulator) webSearchProgress(evt codexEvent) schemas.ChatAssist
 	return call
 }
 
+// Codex sometimes leaves terminal output empty after delivering complete items
+// in output_item.done events. Retain those native items for both response modes.
+type responsesAccumulator struct {
+	items map[int]map[string]any
+}
+
+func (acc *responsesAccumulator) observe(evt codexEvent) {
+	if evt.Type == "response.output_item.done" {
+		item, ok := evt.Raw["item"].(map[string]any)
+		index, indexed := evt.Raw["output_index"].(float64)
+		if ok && indexed && index >= 0 && index == float64(int(index)) {
+			if acc.items == nil {
+				acc.items = make(map[int]map[string]any)
+			}
+			acc.items[int(index)] = item
+		}
+	}
+	if evt.Response == nil || len(acc.items) == 0 {
+		return
+	}
+	switch evt.Type {
+	case "response.completed", "response.failed", "response.incomplete":
+	default:
+		return
+	}
+	output, isArray := evt.Response["output"].([]any)
+	if len(output) != 0 || (!isArray && evt.Response["output"] != nil) {
+		return
+	}
+	indices := make([]int, 0, len(acc.items))
+	for index := range acc.items {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+	output = make([]any, 0, len(indices))
+	for _, index := range indices {
+		output = append(output, acc.items[index])
+	}
+	evt.Response["output"] = output
+}
+
 func streamResponsesChunks(ctx *schemas.BifrostContext, ch chan *schemas.BifrostStreamChunk, resp *codexResponse) {
 	defer close(ch)
 	defer resp.close()
 	defer ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 	stopCancellation := context.AfterFunc(ctx, resp.close)
 	defer stopCancellation()
+	var acc responsesAccumulator
 	send := func(chunk *schemas.BifrostStreamChunk) bool {
 		if ctx.Err() != nil {
 			return false
@@ -566,6 +609,7 @@ func streamResponsesChunks(ctx *schemas.BifrostContext, ch chan *schemas.Bifrost
 			}
 			return
 		}
+		acc.observe(evt)
 		encoded, err := json.Marshal(evt.Raw)
 		if err != nil {
 			send(streamErrorChunk(pluginError(502, "failed to encode upstream stream event", err)))
@@ -595,6 +639,7 @@ func streamResponsesChunks(ctx *schemas.BifrostContext, ch chan *schemas.Bifrost
 }
 func aggregateResponses(resp *codexResponse) (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
 	defer resp.close()
+	var acc responsesAccumulator
 	for {
 		evt, ok := resp.next()
 		if !ok {
@@ -603,6 +648,7 @@ func aggregateResponses(resp *codexResponse) (*schemas.BifrostResponsesResponse,
 		if failure := chatEventFailure(evt); failure != nil {
 			return nil, failure
 		}
+		acc.observe(evt)
 		if evt.Type != "response.completed" {
 			continue
 		}
